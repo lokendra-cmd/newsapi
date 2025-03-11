@@ -7,36 +7,47 @@ import requests
 from bs4 import BeautifulSoup
 import logging
 import os
-import torch
-from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
+import sys
 
 logger = logging.getLogger(__name__)
 
-# Initialize the model globally to avoid reloading it on each request
-# Use a smaller, more efficient model
+# Initialize variables
 MODEL_NAME = "sshleifer/distilbart-cnn-6-6"
 summarizer = None
 
 def get_summarizer():
     global summarizer
     if summarizer is None:
-        # Check if CUDA is available, but default to CPU for Railway
-        device = -1  # Use CPU by default for compatibility
-        
-        # Set lower precision for efficiency
-        torch_dtype = torch.float32
-        if torch.cuda.is_available():
-            device = 0  # Use GPU if available
-            torch_dtype = torch.float16  # Use half precision if on GPU
+        try:
+            # Import torch and transformers here to handle potential import errors
+            import torch
+            from transformers import pipeline
             
-        logger.info(f"Initializing summarization model {MODEL_NAME} on device {device}")
-        summarizer = pipeline(
-            "summarization", 
-            model=MODEL_NAME, 
-            device=device,
-            torch_dtype=torch_dtype
-        )
+            # Always use CPU for Railway deployment
+            device = -1
+            
+            logger.info(f"Initializing summarization model {MODEL_NAME} on CPU")
+            summarizer = pipeline(
+                "summarization", 
+                model=MODEL_NAME, 
+                device=device
+            )
+            return summarizer
+        except Exception as e:
+            logger.error(f"Error initializing summarizer: {str(e)}")
+            # Return a simple fallback summarizer if the model fails to load
+            return FallbackSummarizer()
     return summarizer
+
+class FallbackSummarizer:
+    """A simple fallback summarizer that returns the first few sentences if the model fails to load"""
+    def __call__(self, text, **kwargs):
+        # Simple extractive summary - first 3 sentences or 100 characters
+        sentences = text.split('.')
+        summary = '. '.join(sentences[:3]) + '.'
+        if len(summary) > 100:
+            summary = summary[:100] + '...'
+        return [{'summary_text': f"[BASIC SUMMARY] {summary}"}]
 
 class SummarizeNewsView(APIView):
     """
@@ -76,20 +87,29 @@ class SummarizeNewsView(APIView):
                 summarizer_instance = get_summarizer()
                 
                 # Generate summary with optimized parameters
-                summary = summarizer_instance(
-                    text, 
-                    max_length=100,  # Shorter summary
-                    min_length=30, 
-                    do_sample=False,
-                    truncation=True
-                )
-                
-                # Return the summary as JSON
-                return Response({
-                    'url': url,
-                    'summary': summary[0]['summary_text'],
-                    'status': 'success'
-                }, status=status.HTTP_200_OK)
+                try:
+                    summary = summarizer_instance(
+                        text, 
+                        max_length=100,  # Shorter summary
+                        min_length=30, 
+                        do_sample=False,
+                        truncation=True
+                    )
+                    
+                    # Return the summary as JSON
+                    return Response({
+                        'url': url,
+                        'summary': summary[0]['summary_text'],
+                        'status': 'success'
+                    }, status=status.HTTP_200_OK)
+                except Exception as e:
+                    logger.error(f"Error generating summary: {str(e)}")
+                    # Return a basic summary if the model fails
+                    return Response({
+                        'url': url,
+                        'summary': f"Could not generate AI summary due to an error. Here's the beginning of the article: {text[:150]}...",
+                        'status': 'partial_success'
+                    }, status=status.HTTP_200_OK)
                 
             except requests.exceptions.RequestException as e:
                 logger.error(f"Error fetching URL {url}: {str(e)}")
